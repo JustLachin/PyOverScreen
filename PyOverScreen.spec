@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 
 
 a = Analysis(
@@ -6,7 +7,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('src', 'src')],
-    hiddenimports=[],
+    hiddenimports=['PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -25,7 +26,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -38,7 +39,14 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='PyOverScreen',
 )
+
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='PyOverScreen.app',
+        bundle_identifier='com.github.cavanshirpro.pyoverscreen',
+    )

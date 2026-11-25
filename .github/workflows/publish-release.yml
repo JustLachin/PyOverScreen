@@ -1,0 +1,67 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify the candidate or publish it to GitHub Releases
+        type: choice
+        options: [validate, publish]
+        default: validate
+        required: true
+      build_run_id:
+        description: Successful Build Release Artifacts run ID from main
+        type: string
+        required: true
+      tag:
+        description: New release tag, e.g. v1.1.0 or v1.1.0-rc.1
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pyoverscreen-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      digest: ${{ steps.validate.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify the release candidate
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/publish-release.sh validate
+
+  publish:
+    if: inputs.mode == 'publish'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Publish the verified archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          TAG: ${{ inputs.tag }}
+          VERIFIED_DIGEST: ${{ needs.validate.outputs.digest }}
+        run: bash scripts/publish-release.sh publish

@@ -4,6 +4,8 @@ import json
 import time
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QCheckBox, QSlider, QGroupBox, QFormLayout, QSpinBox,
@@ -17,6 +19,10 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtMultimedia import QSoundEffect, QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtGui import QIcon, QFont, QFontDatabase, QColor, QPalette, QMouseEvent, QDesktopServices, QMovie
+
+ASSET_ROOT = Path(__file__).resolve().parent
+WINDOWS = sys.platform == "win32"
+
 
 class ResizeHandle(QFrame):
     """A widget in the admin panel to resize the overlay by dragging."""
@@ -137,7 +143,6 @@ class OverlayWindow(QMainWindow):
             Qt.FramelessWindowHint | 
             Qt.WindowStaysOnTopHint |
             Qt.Tool | # Helps staying above fullscreen apps
-            Qt.X11BypassWindowManagerHint |
             Qt.WindowTransparentForInput
         )
         
@@ -207,7 +212,7 @@ class OverlayWindow(QMainWindow):
 
     def ensure_topmost(self):
         """Force the window to be at the very top of the Z-order using WinAPI."""
-        if sys.platform == "win32":
+        if WINDOWS:
             try:
                 hwnd = self.winId()
                 
@@ -417,8 +422,9 @@ class OverlayWindow(QMainWindow):
         self.browser.page().runJavaScript(script)
 
 class AdminPanel(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None):
         super().__init__()
+        self.settings = settings if settings is not None else QSettings("PyOverScreen", "Config", self)
         self.setWindowTitle("PyOverScreen - Admin Panel")
         self.setMinimumSize(800, 650)
         
@@ -434,7 +440,7 @@ class AdminPanel(QMainWindow):
         self.load_all_settings()
 
     def load_fonts(self):
-        font_dir = os.path.join(os.getcwd(), "Fonts")
+        font_dir = ASSET_ROOT / "Fonts"
         # Explicitly load all fonts in the Fonts directory
         if os.path.exists(font_dir):
             for font_file in os.listdir(font_dir):
@@ -455,7 +461,7 @@ class AdminPanel(QMainWindow):
 
     def setup_sounds(self):
         self.sounds = {}
-        sound_dir = os.path.join(os.getcwd(), "src", "SND01-sine-sound-pack")
+        sound_dir = ASSET_ROOT / "src" / "SND01-sine-sound-pack"
         sound_files = {
             "click": "button.wav",
             "notify": "notification.wav",
@@ -476,9 +482,9 @@ class AdminPanel(QMainWindow):
             self.sounds[name].play()
 
     def get_icon(self, name):
-        path = os.path.join(os.getcwd(), "src", "regular-free-icon-svgs", f"{name}.svg")
+        path = ASSET_ROOT / "src" / "regular-free-icon-svgs" / f"{name}.svg"
         if os.path.exists(path):
-            return QIcon(path)
+            return QIcon(str(path))
         return QIcon()
 
     def init_ui(self):
@@ -766,6 +772,7 @@ class AdminPanel(QMainWindow):
         self.combo_games.currentIndexChanged.connect(self.on_game_target_changed)
         game_group.setLayout(game_layout)
         display_layout.addWidget(game_group)
+        game_group.setVisible(WINDOWS)
         
         # Interactivity Lock
         self.check_lock = QCheckBox("Lock Overlay (Non-interactive / Click-through)")
@@ -875,7 +882,8 @@ class AdminPanel(QMainWindow):
 
         # Add tabs to main layout
         self.tabs.addTab(self.control_tab, "CONTROL CENTER")
-        self.tabs.addTab(self.target_tab, "TARGET CENTER")
+        if WINDOWS:
+            self.tabs.addTab(self.target_tab, "TARGET CENTER")
         main_layout.addWidget(self.tabs)
 
         # Real-time sync connections
@@ -1039,8 +1047,9 @@ class AdminPanel(QMainWindow):
         self.overlays[self.current_overlay_id].setWindowOpacity(value / 100.0)
 
     def refresh_window_list(self):
-        """Fetch all visible windows and populate the combo box."""
-        if not self.current_overlay_id: return
+        """Fetch all visible Windows windows and populate the combo box."""
+        if not WINDOWS or not self.current_overlay_id:
+            return
         
         current_text = self.combo_games.currentText()
         self.combo_games.clear()
@@ -1082,6 +1091,8 @@ class AdminPanel(QMainWindow):
 
     def refresh_target_center(self):
         """Task Manager style process/window list."""
+        if not WINDOWS:
+            return
         self.process_table.setRowCount(0)
         windows = []
 
@@ -1301,13 +1312,11 @@ class AdminPanel(QMainWindow):
 
     def save_all_settings(self):
         if self.is_loading: return
-        settings = QSettings("PyOverScreen", "Config")
         data = self.get_profile_data()
-        settings.setValue("overlays_json", json.dumps(data))
+        self.settings.setValue("overlays_json", json.dumps(data))
 
     def load_all_settings(self):
-        settings = QSettings("PyOverScreen", "Config")
-        json_str = settings.value("overlays_json", "[]")
+        json_str = self.settings.value("overlays_json", "[]")
         try:
             configs = json.loads(json_str)
             if not configs:
@@ -1319,6 +1328,30 @@ class AdminPanel(QMainWindow):
         except:
             self.add_new_overlay("Default Chat")
 
+def run_smoke_test(app, settings_dir):
+    # Start with the default overlay without touching the user profile.
+    settings = QSettings(str(Path(settings_dir) / "smoke.ini"), QSettings.IniFormat)
+    admin = AdminPanel(settings)
+    admin.show()
+    if admin.get_icon("monitor").pixmap(24, 24).isNull() or len(admin.sounds) != 6:
+        return 2
+
+    overlay = next(iter(admin.overlays.values()))
+    page = overlay.browser.page()
+
+    def check_page(loaded):
+        if loaded:
+            page.runJavaScript(
+                "document.title",
+                lambda title: app.exit(0) if title == "PyOverScreen startup test" else None,
+            )
+
+    page.loadFinished.connect(check_page)
+    QTimer.singleShot(0, lambda: overlay.browser.setHtml("<title>PyOverScreen startup test</title>"))
+    QTimer.singleShot(20000, lambda: app.exit(3))
+    return app.exec()
+
+
 if __name__ == "__main__":
     os.environ["QTWEBENGINE_WIDGETS_RESOURCES_PATH"] = "" 
     
@@ -1327,7 +1360,10 @@ if __name__ == "__main__":
     app.setOrganizationName("PyOverScreen")
     app.setStyle("Fusion")
     
+    if sys.argv[1:] == ["--smoke-test"]:
+        with TemporaryDirectory() as settings_dir:
+            sys.exit(run_smoke_test(app, settings_dir))
+
     admin = AdminPanel()
     admin.show()
-    
     sys.exit(app.exec())
