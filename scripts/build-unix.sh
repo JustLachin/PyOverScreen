@@ -8,8 +8,7 @@ case "$(uname -m)" in
     *) echo "Unsupported build architecture." >&2; exit 1 ;;
 esac
 
-python -m py_compile PyOverScreen.py
-python -m PyInstaller --clean --noconfirm PyOverScreen.spec
+python scripts/build_nuitka.py
 mkdir -p artifacts
 
 case "$(uname -s)" in

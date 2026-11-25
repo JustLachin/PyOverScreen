@@ -4,11 +4,15 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   desktop:
@@ -22,10 +26,10 @@ jobs:
           - {target: linux-x64, runner: ubuntu-22.04, arch: x64, extension: tar.gz}
           - {target: linux-arm64, runner: ubuntu-24.04-arm, arch: arm64, extension: tar.gz}
           - {target: macos-x64, runner: macos-15-intel, arch: x64, extension: zip}
-          - {target: macos-arm64, runner: macos-26, arch: arm64, extension: zip}
+          - {target: macos-arm64, runner: xcode-27, arch: arm64, extension: zip}
     env:
       ARCHIVE: PyOverScreen-${{ matrix.target }}.${{ matrix.extension }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -35,7 +39,9 @@ jobs:
           python-version: '3.13'
           architecture: ${{ matrix.arch }}
           cache: pip
-          cache-dependency-path: requirements-build.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
       - name: Install Linux GUI and test dependencies
         if: runner.os == 'Linux'
         run: |
@@ -44,7 +50,7 @@ jobs:
           if [ "$(lsb_release -rs)" = "24.04" ]; then
             minizip=libminizip1t64
           fi
-          sudo apt-get install -y xvfb xauth libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+          sudo apt-get install -y xvfb xauth openbox x11-utils patchelf libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
             libxkbcommon-x11-0 libegl1 libgl1 libgbm1 libnss3 libpulse0 libpipewire-0.3-0 \
             libgstreamer-plugins-base1.0-0 libgstreamer-plugins-bad1.0-0 "$minizip"
@@ -86,7 +92,16 @@ jobs:
           stage="$(mktemp -d)"
           tar -xzf "artifacts/$ARCHIVE" -C "$stage"
           cd "$RUNNER_TEMP"
-          timeout 60s xvfb-run -a "$stage/PyOverScreen/PyOverScreen" --smoke-test
+          timeout 60s xvfb-run -a bash -c '
+            openbox >/dev/null 2>&1 &
+            export PYOVERSCREEN_SMOKE_X11_TARGET="PyOverScreen CI Target"
+            xmessage -title "$PYOVERSCREEN_SMOKE_X11_TARGET" "Window targeting fixture" &
+            for attempt in {1..30}; do
+              if xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -q "0x"; then break; fi
+              sleep 0.1
+            done
+            exec "$1" --x11 --smoke-test
+          ' _ "$stage/PyOverScreen/PyOverScreen"
       - name: Launch the extracted macOS application
         if: runner.os == 'macOS'
         shell: bash

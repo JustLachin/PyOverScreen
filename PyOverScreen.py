@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFrame, QSizePolicy, QListWidget, QListWidgetItem,
                              QInputDialog, QMessageBox, QFileDialog, QComboBox,
                              QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView)
-from PySide6.QtCore import Qt, QUrl, QPoint, QSize, QSettings, Signal, QTimer
+from PySide6.QtCore import Qt, QUrl, QPoint, QRect, QSize, QSettings, Signal, QSignalBlocker, QTimer
 from PySide6.QtGui import QIcon, QFont, QFontDatabase, QColor, QPalette, QMouseEvent
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -22,6 +22,10 @@ from PySide6.QtGui import QIcon, QFont, QFontDatabase, QColor, QPalette, QMouseE
 
 ASSET_ROOT = Path(__file__).resolve().parent
 WINDOWS = sys.platform == "win32"
+LINUX = sys.platform.startswith("linux")
+
+if LINUX:
+    from x11_windows import connect_x11
 
 
 class ResizeHandle(QFrame):
@@ -123,7 +127,7 @@ class MoveHandle(QFrame):
         super().paintEvent(event)
 
 class OverlayWindow(QMainWindow):
-    def __init__(self, overlay_id, name="New Overlay"):
+    def __init__(self, overlay_id, name="New Overlay", x11=None):
         super().__init__()
         self.overlay_id = overlay_id
         self.name = name
@@ -136,6 +140,10 @@ class OverlayWindow(QMainWindow):
         self.target_hwnd = None
         self.target_title = None
         self.target_pid = None
+        self.x11 = x11
+        self.x11_target_id = None
+        self.x11_target = None
+        self.profile_position = QPoint(100, 100)
         
         # Window settings
         self.setWindowFlags(
@@ -184,7 +192,8 @@ class OverlayWindow(QMainWindow):
         # Windows-specific TopMost reinforcement
         self.topmost_timer = QTimer(self)
         self.topmost_timer.timeout.connect(self.ensure_topmost)
-        self.topmost_timer.start(200) # Faster refresh (200ms) for Full Screen games
+        if WINDOWS or self.x11:
+            self.topmost_timer.start(200)
         
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.EndOfMedia and self.loop_media:
@@ -280,6 +289,10 @@ class OverlayWindow(QMainWindow):
             except Exception as e:
                 print(f"Topmost error: {e}")
 
+        elif self.x11 and self.x11_target and self.isVisible():
+            if self.x11.should_raise(int(self.winId()), self.x11_target_id, self.x11_target):
+                self.raise_()
+
     def recover_target_hwnd(self):
         """Try to re-find the target window handle if it was lost."""
         if not self.target_title: return
@@ -304,6 +317,7 @@ class OverlayWindow(QMainWindow):
 
     def set_interactive(self, interactive):
         """Toggle between interactive (mouse clicks) and click-through."""
+        geometry = self.geometry()
         flags = self.windowFlags()
         if interactive:
             flags &= ~Qt.WindowTransparentForInput
@@ -315,6 +329,7 @@ class OverlayWindow(QMainWindow):
         # After changing flags, we must re-show and re-apply attributes
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setGeometry(geometry)
         self.show()
         self.ensure_topmost()
 
@@ -326,7 +341,10 @@ class OverlayWindow(QMainWindow):
             self.gif_movie.stop()
         self.image_label.clear()
         
-        if not url_str:
+        if not url_str.strip():
+            self.video_output.hide()
+            self.image_label.hide()
+            self.browser.show()
             self.browser.setHtml("")
             return
             
@@ -336,11 +354,15 @@ class OverlayWindow(QMainWindow):
         # Check if it's a local file
         is_local = False
         potential_path = url_str
-        if url_str.startswith('file:///'):
-            potential_path = QUrl(url_str).toLocalFile()
+        url = QUrl(url_str)
+        if url.isLocalFile():
+            potential_path = url.toLocalFile()
             is_local = True
-        elif os.path.exists(url_str):
-            is_local = True
+        else:
+            potential_path = os.path.expanduser(url_str)
+            is_local = os.path.isfile(potential_path)
+        if is_local:
+            potential_path = os.path.abspath(potential_path)
 
         if is_local:
             file_url = QUrl.fromLocalFile(potential_path)
@@ -425,6 +447,9 @@ class AdminPanel(QMainWindow):
     def __init__(self, settings=None):
         super().__init__()
         self.settings = settings if settings is not None else QSettings("PyOverScreen", "Config", self)
+        platform = QApplication.platformName()
+        self.wayland = LINUX and platform.startswith("wayland")
+        self.x11 = connect_x11() if LINUX and platform == "xcb" else None
         self.setWindowTitle("PyOverScreen - Admin Panel")
         self.setMinimumSize(800, 650)
         
@@ -772,14 +797,24 @@ class AdminPanel(QMainWindow):
         self.combo_games.currentIndexChanged.connect(self.on_game_target_changed)
         game_group.setLayout(game_layout)
         display_layout.addWidget(game_group)
-        game_group.setVisible(WINDOWS)
+        game_group.setVisible(WINDOWS or self.x11 is not None)
         
         # Interactivity Lock
         self.check_lock = QCheckBox("Lock Overlay (Non-interactive / Click-through)")
         self.check_lock.setChecked(True)
-        self.check_lock.stateChanged.connect(self.on_lock_changed)
+        self.check_lock.toggled.connect(self.on_lock_changed)
         display_layout.addWidget(self.check_lock)
         
+        if self.wayland:
+            for control in (self.spin_x, self.spin_y, self.move_handle):
+                control.setEnabled(False)
+            notice = QLabel(
+                "Wayland controls overlay position and stacking. "
+                "Use --x11 for XWayland window targeting."
+            )
+            notice.setWordWrap(True)
+            display_layout.addWidget(notice)
+
         config_layout.addLayout(display_layout)
         
         # Media Settings
@@ -862,18 +897,18 @@ class AdminPanel(QMainWindow):
         target_header.addWidget(target_title)
         target_header.addStretch()
         
-        self.btn_refresh_target_center = QPushButton("Refresh All Processes")
+        self.btn_refresh_target_center = QPushButton("Refresh Windows")
         self.btn_refresh_target_center.setIcon(self.get_icon("rotate-right"))
         self.btn_refresh_target_center.clicked.connect(self.refresh_target_center)
         target_header.addWidget(self.btn_refresh_target_center)
         target_tab_layout.addLayout(target_header)
         
-        target_info = QLabel("Select a process/window to force all overlays to stay on top of it. Double-click to set as primary target.")
+        target_info = QLabel("Double-click a window to set it as the target for the selected overlay.")
         target_info.setStyleSheet("color: #888; font-style: italic;")
         target_tab_layout.addWidget(target_info)
         
         self.process_table = QTableWidget(0, 3)
-        self.process_table.setHorizontalHeaderLabels(["Icon", "Process / Window Title", "Handle (HWND)"])
+        self.process_table.setHorizontalHeaderLabels(["Icon", "Window Title", "Window ID"])
         self.process_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.process_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.process_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -882,7 +917,7 @@ class AdminPanel(QMainWindow):
 
         # Add tabs to main layout
         self.tabs.addTab(self.control_tab, "CONTROL CENTER")
-        if WINDOWS:
+        if WINDOWS or self.x11:
             self.tabs.addTab(self.target_tab, "TARGET CENTER")
         main_layout.addWidget(self.tabs)
 
@@ -903,7 +938,7 @@ class AdminPanel(QMainWindow):
         
         overlay_id = str(hash(name + str(time.time_ns()))) if config is None else config.get('id')
         
-        overlay = OverlayWindow(overlay_id, name)
+        overlay = OverlayWindow(overlay_id, name, self.x11)
         self.overlays[overlay_id] = overlay
         
         item = QListWidgetItem(name)
@@ -931,6 +966,7 @@ class AdminPanel(QMainWindow):
         
         # Create a new config based on the current state of the source overlay
         geom = source_overlay.geometry()
+        pos = source_overlay.profile_position if self.wayland else geom.topLeft()
         config = {
             'id': str(hash(item.text() + " (Clone)" + str(time.time_ns()))),
             'name': item.text() + " (Clone)",
@@ -945,6 +981,7 @@ class AdminPanel(QMainWindow):
             'target_hwnd': source_overlay.target_hwnd,
             'target_title': source_overlay.target_title,
             'target_pid': source_overlay.target_pid,
+            'x11_target': source_overlay.x11_target,
             'loop': source_overlay.loop_media,
             'volume': source_overlay.volume
         }
@@ -996,8 +1033,9 @@ class AdminPanel(QMainWindow):
         # Update UI fields from overlay state
         self.url_input.setText(overlay.current_source)
         geom = overlay.geometry()
-        self.spin_x.setValue(geom.x())
-        self.spin_y.setValue(geom.y())
+        pos = overlay.profile_position if self.wayland else geom.topLeft()
+        self.spin_x.setValue(pos.x())
+        self.spin_y.setValue(pos.y())
         self.spin_w.setValue(geom.width())
         self.spin_h.setValue(geom.height())
         
@@ -1008,21 +1046,8 @@ class AdminPanel(QMainWindow):
         self.check_loop.setChecked(overlay.loop_media)
         self.slider_volume.setValue(overlay.volume)
         
-        # Update Game Target Combo
         self.refresh_window_list()
-        if overlay.target_hwnd:
-            # Try to find by HWND first (might have changed, but titles are more stable)
-            found = False
-            for i in range(self.combo_games.count()):
-                if self.combo_games.itemData(i) == overlay.target_hwnd:
-                    self.combo_games.setCurrentIndex(i)
-                    found = True
-                    break
-            if not found:
-                self.combo_games.setCurrentIndex(0)
-        else:
-            self.combo_games.setCurrentIndex(0)
-        
+
         is_locked = bool(overlay.windowFlags() & Qt.WindowTransparentForInput)
         self.check_lock.setChecked(is_locked)
         
@@ -1046,121 +1071,97 @@ class AdminPanel(QMainWindow):
         if self.is_loading or not self.current_overlay_id: return
         self.overlays[self.current_overlay_id].setWindowOpacity(value / 100.0)
 
+    def target_windows(self):
+        if self.x11:
+            windows = self.x11.list_windows()
+        elif WINDOWS:
+            windows = []
+
+            def enum_handler(hwnd, lparam):
+                if ctypes.windll.user32.IsWindowVisible(hwnd):
+                    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buff = ctypes.create_unicode_buffer(length + 1)
+                        ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
+                        title = buff.value
+                        if title and "PyOverScreen" not in title:
+                            pid = wintypes.DWORD()
+                            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                            windows.append((title, hwnd, pid.value, ""))
+                return True
+
+            enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            ctypes.windll.user32.EnumWindows(enum_proc(enum_handler), 0)
+        else:
+            windows = []
+
+        return sorted(windows, key=lambda window: window[0].casefold())
+
     def refresh_window_list(self):
-        """Fetch all visible Windows windows and populate the combo box."""
-        if not WINDOWS or not self.current_overlay_id:
-            return
-        
-        current_text = self.combo_games.currentText()
-        self.combo_games.clear()
-        self.combo_games.addItem("None (Standard TopMost)", 0)
-        
-        windows = []
-        
-        def enum_handler(hwnd, lparam):
-            if ctypes.windll.user32.IsWindowVisible(hwnd):
-                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buff = ctypes.create_unicode_buffer(length + 1)
-                    ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
-                    title = buff.value
-                    # Filter out some common system windows and our own
-                    if title and title not in ["Program Manager", "Settings", "Microsoft Text Input Application"]:
-                        if "PyOverScreen" not in title:
-                            windows.append((title, hwnd))
-            return True
-
-        ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        ctypes.windll.user32.EnumWindows(ENUM_WINDOWS_PROC(enum_handler), 0)
-        
-        # Sort alphabetically
-        windows.sort(key=lambda x: x[0].lower())
-        
-        for title, hwnd in windows:
-            self.combo_games.addItem(title, hwnd)
-            
-        # Try to restore previous selection
-        index = self.combo_games.findText(current_text)
-        if index >= 0:
-            self.combo_games.setCurrentIndex(index)
-
-    def on_game_target_changed(self, index):
-        if self.is_loading or not self.current_overlay_id: return
-        hwnd = self.combo_games.currentData()
-        self.overlays[self.current_overlay_id].target_hwnd = hwnd if hwnd != 0 else None
-
-    def refresh_target_center(self):
-        """Task Manager style process/window list."""
-        if not WINDOWS:
-            return
-        self.process_table.setRowCount(0)
-        windows = []
-
-        def enum_handler(hwnd, lparam):
-            if ctypes.windll.user32.IsWindowVisible(hwnd):
-                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buff = ctypes.create_unicode_buffer(length + 1)
-                    ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
-                    title = buff.value
-                    if title and "PyOverScreen" not in title:
-                        # Get PID
-                        pid = ctypes.wintypes.DWORD()
-                        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                        windows.append((title, hwnd, pid.value))
-            return True
-
-        ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        ctypes.windll.user32.EnumWindows(ENUM_WINDOWS_PROC(enum_handler), 0)
-        
-        self.process_table.setRowCount(len(windows))
-        for i, (title, hwnd, pid) in enumerate(windows):
-            # Icon (Placeholder or system icon if possible)
-            icon_item = QTableWidgetItem()
-            icon_item.setIcon(self.get_icon("monitor"))
-            
-            title_item = QTableWidgetItem(f"{title} (PID: {pid})")
-            hwnd_item = QTableWidgetItem(hex(hwnd))
-            hwnd_item.setData(Qt.UserRole, hwnd)
-            
-            self.process_table.setItem(i, 0, icon_item)
-            self.process_table.setItem(i, 1, title_item)
-            self.process_table.setItem(i, 2, hwnd_item)
-
-    def on_process_double_clicked(self, index):
-        """Set the double-clicked window as the target for the current overlay."""
         if not self.current_overlay_id:
-            QMessageBox.warning(self, "Warning", "Please select an overlay first in Control Center!")
             return
-            
-        row = index.row()
-        hwnd = self.process_table.item(row, 2).data(Qt.UserRole)
-        full_title_text = self.process_table.item(row, 1).text()
-        
-        # Extract title and PID from text: "Title (PID: 123)"
-        title = full_title_text
-        pid = None
-        if " (PID: " in full_title_text:
-            title = full_title_text.split(" (PID: ")[0]
-            try:
-                pid = int(full_title_text.split(" (PID: ")[1].rstrip(")"))
-            except: pass
 
         overlay = self.overlays[self.current_overlay_id]
-        overlay.target_hwnd = hwnd
-        overlay.target_title = title
-        overlay.target_pid = pid
-        
-        QMessageBox.information(self, "Success", f"Target set to:\n{title}\n\nOverlay will now force itself on top of this window even if it restarts!")
-        
-        # Switch back to control center to see the change
-        self.tabs.setCurrentIndex(0)
-        self.refresh_window_list()
+        selected = 0
+        with QSignalBlocker(self.combo_games):
+            self.combo_games.clear()
+            self.combo_games.addItem("None (Standard TopMost)")
+            for window in self.target_windows():
+                title, window_id, _, wm_class = window
+                self.combo_games.addItem(title, window)
+                if self.x11:
+                    if window_id == overlay.x11_target_id or (
+                        selected == 0 and overlay.x11_target == (title, wm_class)
+                    ):
+                        selected = self.combo_games.count() - 1
+                elif window_id == overlay.target_hwnd:
+                    selected = self.combo_games.count() - 1
+            self.combo_games.setCurrentIndex(selected)
 
-    def on_lock_changed(self, state):
-        if self.is_loading or not self.current_overlay_id: return
-        is_locked = (state == Qt.Checked)
-        self.overlays[self.current_overlay_id].set_interactive(not is_locked)
+    def set_overlay_target(self, window):
+        overlay = self.overlays[self.current_overlay_id]
+        title, window_id, pid, wm_class = window or (None, None, None, None)
+        if self.x11:
+            overlay.x11_target_id = window_id
+            overlay.x11_target = (title, wm_class) if window_id is not None else None
+        elif WINDOWS:
+            overlay.target_hwnd = window_id
+            overlay.target_title = title
+            overlay.target_pid = pid
+        self.save_all_settings()
+
+    def on_game_target_changed(self, index):
+        if not self.is_loading and self.current_overlay_id:
+            self.set_overlay_target(self.combo_games.itemData(index))
+
+    def refresh_target_center(self):
+        windows = self.target_windows()
+        self.process_table.setRowCount(len(windows))
+        for row, window in enumerate(windows):
+            title, window_id, pid, _ = window
+            icon = QTableWidgetItem()
+            icon.setIcon(self.get_icon("monitor"))
+            title_item = QTableWidgetItem(f"{title} (PID: {pid})" if pid else title)
+            id_item = QTableWidgetItem(hex(window_id))
+            id_item.setData(Qt.UserRole, window)
+            self.process_table.setItem(row, 0, icon)
+            self.process_table.setItem(row, 1, title_item)
+            self.process_table.setItem(row, 2, id_item)
+
+    def on_process_double_clicked(self, index):
+        if not self.current_overlay_id:
+            QMessageBox.warning(self, "Warning", "Select an overlay in Control Center first.")
+            return
+        item = self.process_table.item(index.row(), 2)
+        if item:
+            self.set_overlay_target(item.data(Qt.UserRole))
+            self.tabs.setCurrentIndex(0)
+            self.refresh_window_list()
+
+    def on_lock_changed(self, locked):
+        if not self.is_loading and self.current_overlay_id:
+            self.overlays[self.current_overlay_id].set_interactive(not locked)
+            self.save_all_settings()
 
     def on_zoom_changed(self, value):
         if self.is_loading or not self.current_overlay_id: return
@@ -1185,8 +1186,6 @@ class AdminPanel(QMainWindow):
         )
         
         if file_path:
-            # Convert to forward slashes for cross-platform compatibility
-            file_path = file_path.replace("\\", "/")
             self.url_input.setText(file_path)
             # Trigger update immediately
             self.save_current_settings()
@@ -1199,20 +1198,20 @@ class AdminPanel(QMainWindow):
 
     def sync_overlay_geometry(self):
         if self.is_loading or not self.current_overlay_id: return
-        self.overlays[self.current_overlay_id].setGeometry(
-            self.spin_x.value(),
-            self.spin_y.value(),
-            self.spin_w.value(),
-            self.spin_h.value()
-        )
+        overlay = self.overlays[self.current_overlay_id]
+        size = QSize(self.spin_w.value(), self.spin_h.value())
+        if self.wayland:
+            overlay.resize(size)
+        else:
+            overlay.setGeometry(QRect(QPoint(self.spin_x.value(), self.spin_y.value()), size))
 
     def apply_config_to_overlay(self, overlay, config):
-        overlay.setGeometry(
-            config.get('x', 100),
-            config.get('y', 100),
-            config.get('w', 400),
-            config.get('h', 600)
-        )
+        overlay.profile_position = QPoint(config.get('x', 100), config.get('y', 100))
+        size = QSize(config.get('w', 400), config.get('h', 600))
+        if self.wayland:
+            overlay.resize(size)
+        else:
+            overlay.setGeometry(QRect(overlay.profile_position, size))
         overlay.setWindowOpacity(config.get('opacity', 100) / 100.0)
         overlay.update_zoom(config.get('zoom', 1.0))
         overlay.set_media_settings(config.get('loop', True), config.get('volume', 50))
@@ -1222,6 +1221,10 @@ class AdminPanel(QMainWindow):
         overlay.target_hwnd = config.get('target_hwnd', None)
         overlay.target_title = config.get('target_title', None)
         overlay.target_pid = config.get('target_pid', None)
+        identity = config.get('x11_target')
+        if isinstance(identity, (list, tuple)) and len(identity) == 2:
+            if all(isinstance(value, str) for value in identity):
+                overlay.x11_target = tuple(identity)
         
         # Load URL after settings to ensure media settings are applied
         overlay.load_url(config.get('url', ''))
@@ -1274,12 +1277,13 @@ class AdminPanel(QMainWindow):
             oid = item.data(Qt.UserRole)
             overlay = self.overlays[oid]
             geom = overlay.geometry()
+            pos = overlay.profile_position if self.wayland else geom.topLeft()
             data.append({
                 'id': oid,
                 'name': item.text(),
                 'url': overlay.current_source,
-                'x': geom.x(),
-                'y': geom.y(),
+                'x': pos.x(),
+                'y': pos.y(),
                 'w': geom.width(),
                 'h': geom.height(),
                 'opacity': int(overlay.windowOpacity() * 100),
@@ -1288,6 +1292,7 @@ class AdminPanel(QMainWindow):
                 'target_hwnd': overlay.target_hwnd,
                 'target_title': overlay.target_title,
                 'target_pid': overlay.target_pid,
+                'x11_target': overlay.x11_target,
                 'loop': overlay.loop_media,
                 'volume': overlay.volume
             })
@@ -1337,6 +1342,29 @@ def run_smoke_test(app, settings_dir):
         return 2
 
     overlay = next(iter(admin.overlays.values()))
+    geometry = overlay.geometry()
+    admin.check_lock.setChecked(False)
+    if overlay.windowFlags() & Qt.WindowTransparentForInput:
+        return 4
+    admin.check_lock.setChecked(True)
+    if not overlay.windowFlags() & Qt.WindowTransparentForInput:
+        return 4
+    if not admin.wayland and overlay.geometry() != geometry:
+        return 4
+
+    target_title = os.environ.get("PYOVERSCREEN_SMOKE_X11_TARGET")
+    if target_title:
+        admin.refresh_window_list()
+        index = admin.combo_games.findText(target_title)
+        if index < 1:
+            print("The X11 fixture is missing from the target selector.", file=sys.stderr)
+            return 5
+        admin.combo_games.setCurrentIndex(index)
+        admin.refresh_window_list()
+        profile_target = admin.get_profile_data()[0]["x11_target"]
+        if admin.combo_games.currentText() != target_title or profile_target[0] != target_title:
+            return 5
+
     page = overlay.browser.page()
 
     def check_page(loaded):
@@ -1353,8 +1381,12 @@ def run_smoke_test(app, settings_dir):
 
 
 if __name__ == "__main__":
-    os.environ["QTWEBENGINE_WIDGETS_RESOURCES_PATH"] = "" 
-    
+    if LINUX and "--x11" in sys.argv:
+        if not os.environ.get("DISPLAY"):
+            sys.exit("--x11 requires a running X11 or XWayland display.")
+        sys.argv.remove("--x11")
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
     app = QApplication(sys.argv)
     app.setApplicationName("PyOverScreen")
     app.setOrganizationName("PyOverScreen")

@@ -3,8 +3,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
-    python -m py_compile PyOverScreen.py
-    python -m PyInstaller --clean --noconfirm PyOverScreen.spec
+    python scripts/build_nuitka.py
 
     New-Item -ItemType Directory -Force artifacts | Out-Null
     $archive = 'PyOverScreen-windows-x64.zip'

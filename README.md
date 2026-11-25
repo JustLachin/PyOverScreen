@@ -9,19 +9,30 @@ PyOverScreen is a powerful overlay management tool built with PySide6. It allows
 - Support for URLs, local images, GIFs, and Videos.
 - Lock/Unlock overlays for interaction or click-through.
 - Save and load profiles.
-- Target specific game windows for forced visibility on Windows. Fullscreen behavior depends on the game and Windows.
+- Target individual windows on Windows and X11. Fullscreen stacking depends on the window manager.
 
 ## Installation
 1. Install Python 3.10+
 2. Install dependencies:
    ```bash
-   pip install PySide6 pygame
+   python -m pip install -r requirements.txt
    ```
 
 ## Running the App
 ```bash
 python PyOverScreen.py
 ```
+
+## Linux sessions
+
+- **X11** supports overlay positioning, click-through, and targeting windows
+  listed by an EWMH-compatible window manager. Transparency needs a compositor.
+- **Wayland** delegates global positioning and stacking to the compositor. On KDE
+  Plasma, use KWin window rules for position and Keep Above if the compositor
+  allows them. For X11 controls on a Wayland session, run
+  `./PyOverScreen/PyOverScreen --x11` after extracting the archive.
+  XWayland window targeting sees X11 clients. Native Wayland clients are managed
+  by the compositor, and fullscreen stacking over them is compositor-dependent.
 
 ## Desktop packages
 
@@ -39,11 +50,11 @@ or Wayland compositor. The macOS app is built without Apple notarization.
 
 ### Building locally
 
-Use Python 3.13 for the target architecture and install the build dependencies
+The portable builds use Nuitka. Use Python 3.13 for the target architecture and install the build dependencies
 with `python -m pip install -r requirements-build.txt`. Run
 `./scripts/build-windows.ps1` in PowerShell 7 on Windows or
 `bash scripts/build-unix.sh` on Linux or macOS. The package and its SHA-256 file
-are written to `artifacts/`.
+are written to `artifacts/`. Linux uses GCC and `patchelf`, Windows uses MSVC, and macOS uses the Xcode command-line tools.
 
 ## Publishing a GitHub release
 
